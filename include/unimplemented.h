@@ -13,7 +13,7 @@ static inline void unimplemented(const char *s)
 }
 
 // Macro helper to automatically capture current function name
-#define UNIMPLEMENTED                                                                            \
+#define UNIMPLEMENTED                                                                              \
 	do                                                                                             \
 	{                                                                                              \
 		fprintf(stderr, "UNIMPLEMENTED: Function %s has no implementation yet\n", __func__);       \
