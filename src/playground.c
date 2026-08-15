@@ -1,41 +1,443 @@
 #include <assert.h>
+#include <stdalign.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdalign.h>
 
-#define DATA_CAPACITY 256
-#define ITEM_CAPACITY 256
+#define DATA_CAPACITY 2
+#define ITEM_CAPACITY 1
+#define GROWTH_FACTOR 2
 
-struct array_header
-{
-	size_t length;        // number of logical items
-	size_t data_used;     // payload bytes currently occupied
-	size_t data_capacity; // payload bytes allocated
-	size_t item_capacity; // number of metadata entries allocated
-};
+/*
+ * ============================================================
+ * NEXT STEPS / DESIGN NOTES
+ * ============================================================
+ *
+ * CURRENT DESIGN
+ *
+ * array_header allocation:
+ *
+ *     [ array_header ][ packed array data ................. ]
+ *
+ * array_header->item_header points to a separate allocation:
+ *
+ *     [ item_header ][ item_header ][ item_header ] ...
+ *
+ *
+ * LOOKUP
+ *
+ *     logical index
+ *          ↓
+ *     item_header[index]
+ *          ↓
+ *        offset
+ *          ↓
+ *     array_data + offset
+ *
+ *
+ * ------------------------------------------------------------
+ * TODO 1: REWORK DATA GROWTH / REALLOCATION
+ * ------------------------------------------------------------
+ *
+ * Current realloc implementation has an important problem:
+ *
+ * `data`, alignment calculations, padding, and destination_start
+ * are calculated BEFORE realloc().
+ *
+ * realloc() may move the array allocation to a different address.
+ * If this happens:
+ *
+ *     - `header` changes
+ *     - array data base address changes
+ *     - previous `data` pointer becomes invalid
+ *     - previous alignment calculation may no longer be valid
+ *     - previous destination_start may no longer satisfy alignment
+ *
+ * Possible next implementation:
+ *
+ * Instead of directly reallocating the packed data allocation:
+ *
+ *     1. Calculate required new capacity.
+ *     2. malloc() a new array allocation.
+ *     3. Copy/rebuild the array header.
+ *     4. Determine the NEW payload base address.
+ *     5. Walk through each logical item.
+ *     6. Recalculate padding for that item's alignment using
+ *        the new base address.
+ *     7. Copy the old item's bytes into the new aligned location.
+ *     8. Update that item's metadata offset.
+ *     9. Update data_used as items are repacked.
+ *    10. Only after the entire move succeeds:
+ *            free(old_arr);
+ *            arr = new_arr;
+ *
+ * This would effectively COMPACT + REALIGN the entire payload
+ * whenever the data allocation grows.
+ *
+ *
+ * IMPORTANT:
+ *
+ * In order to rebuild/repack old items while preserving their
+ * alignment, array_item_header will probably need to remember
+ * each item's required alignment.
+ *
+ * Possible future metadata:
+ *
+ *     offset
+ *     size
+ *     alignment
+ *
+ * Do not implement blindly yet — explore whether alignment must
+ * remain stored permanently or whether another design is better.
+ *
+ *
+ * ------------------------------------------------------------
+ * TODO 2: CAPACITY GROWTH
+ * ------------------------------------------------------------
+ *
+ * Data capacity and item-header capacity are independent:
+ *
+ *     data_capacity -> bytes
+ *     item_capacity -> number of logical item metadata entries
+ *
+ * Grow them independently.
+ *
+ * Data growth may require repacking because addresses/alignment
+ * can change.
+ *
+ * item_header growth does NOT require moving array payload data
+ * because item_header currently lives in a separate allocation.
+ *
+ * Also consider:
+ *
+ *     - capacity == 0
+ *     - a single appended item larger than one growth step
+ *     - size_t overflow when calculating allocation sizes
+ *
+ *
+ * ------------------------------------------------------------
+ * TODO 3: POINTER INVALIDATION POLICY
+ * ------------------------------------------------------------
+ *
+ * array_get() returns a pointer directly into internal array data.
+ *
+ * Example:
+ *
+ *     int *p = array_get(arr, 1);
+ *
+ * `p` is a PHYSICAL pointer to the bytes at the current location.
+ *
+ * If metadata later changes:
+ *
+ *     array_get(arr, 1)
+ *
+ * may resolve to a different logical item, while `p` still points
+ * to the old physical bytes.
+ *
+ * If the payload allocation is moved/rebuilt:
+ *
+ *     ALL previously returned pointers into the old payload
+ *     become invalid/dangling.
+ *
+ * Need to decide/document a policy such as:
+ *
+ *     "Pointers returned by array_get() remain valid only until
+ *      an operation that relocates/rebuilds the payload."
+ *
+ * Similar to pointer/reference invalidation rules in other
+ * dynamic containers.
+ *
+ *
+ * ------------------------------------------------------------
+ * TODO 4: REMOVE POLICY
+ * ------------------------------------------------------------
+ *
+ * Current remove implementation performs LOGICAL REMOVAL only.
+ *
+ * It shifts item_header entries so the removed item is no longer
+ * reachable by its logical index.
+ *
+ * It DOES NOT currently:
+ *
+ *     - remove bytes from array_data
+ *     - compact payload data
+ *     - reclaim removed item's space
+ *     - decrease data_used
+ *
+ * Consequence:
+ *
+ *     old pointer returned by array_get()
+ *              ↓
+ *         still points to old bytes
+ *
+ * even though that item has been removed logically.
+ *
+ * This creates internal fragmentation/dead space.
+ *
+ *
+ * Possible temporary experiment:
+ *
+ *     memset() removed bytes after removing the metadata entry.
+ *
+ * BUT:
+ *
+ *     memset(..., 0, size)
+ *
+ * should NOT be treated as a generic guarantee that an arbitrary
+ * C object now has the logical value "zero".
+ *
+ * An all-zero byte representation is not something this generic
+ * container should assume represents every possible type/value.
+ *
+ * Zeroing can instead be considered:
+ *
+ *     - debug hygiene
+ *     - making stale raw bytes visibly overwritten
+ *     - an experiment while deciding the real removal policy
+ *
+ * It does NOT solve pointer invalidation.
+ *
+ *
+ * Future removal approaches to explore:
+ *
+ * A. Logical deletion only
+ *      + simple
+ *      + existing object addresses remain stable
+ *      - fragmentation
+ *
+ * B. Compact payload immediately
+ *      + reclaim memory
+ *      - O(n)
+ *      - objects move
+ *      - old pointers may become invalid
+ *      - alignment must be recalculated
+ *
+ * C. Keep holes and reuse them later
+ *      + avoids moving everything
+ *      - requires free-space metadata
+ *      - starts becoming allocator-like
+ *
+ *
+ * ------------------------------------------------------------
+ * TODO 5: REMOVE + ALIGNMENT
+ * ------------------------------------------------------------
+ *
+ * If physical compaction is implemented later, DO NOT simply
+ * shift arbitrary bytes left by removed_size.
+ *
+ * Example:
+ *
+ *     [ char data ][padding][int][padding][struct]
+ *
+ * Removing an earlier object changes candidate addresses for all
+ * following objects.
+ *
+ * Every moved object may need its destination recalculated using:
+ *
+ *     actual destination address
+ *     size
+ *     required alignment
+ *
+ * This is another reason item metadata may eventually need to
+ * store alignment.
+ *
+ *
+ * ------------------------------------------------------------
+ * TODO 6: ARRAY_GET
+ * ------------------------------------------------------------
+ *
+ * Improve array_get() tomorrow:
+ *
+ *     - validate arr != NULL
+ *     - validate item_header != NULL
+ *     - validate index < length
+ *     - document pointer invalidation semantics
+ *
+ * Potential future API:
+ *
+ *     array_get()      -> raw pointer
+ *     array_item_size() -> stored byte size
+ *
+ * Caller remains responsible for interpreting/casting the raw
+ * bytes as the correct type.
+ *
+ *
+ * ------------------------------------------------------------
+ * TODO 7: ARRAY_REMOVE BOUNDS CHECK
+ * ------------------------------------------------------------
+ *
+ * Current index check needs review.
+ *
+ * index is size_t, therefore:
+ *
+ *     index < 0
+ *
+ * is not meaningful because size_t is unsigned.
+ *
+ * Also revisit the exact upper-bound condition.
+ *
+ * Do this while cleaning array_remove().
+ *
+ *
+ * ------------------------------------------------------------
+ * TODO 8: ARRAY DESTRUCTION
+ * ------------------------------------------------------------
+ *
+ * The array currently owns TWO allocations:
+ *
+ *     arr
+ *     arr->item_header
+ *
+ * Calling only:
+ *
+ *     free(arr);
+ *
+ * does not release item_header.
+ *
+ * Introduce something like array_free()/array_destroy() later
+ * so ownership is centralized.
+ *
+ *
+ * ------------------------------------------------------------
+ * TODO 9: OPTIONAL FUTURE SINGLE-ALLOCATION DESIGN
+ * ------------------------------------------------------------
+ *
+ * Current two-allocation design is useful because:
+ *
+ *     payload grows independently
+ *     metadata grows independently
+ *
+ * Later experiment with:
+ *
+ *     [header][metadata region][payload region]
+ *
+ * only after the current design is stable.
+ *
+ * That introduces another problem:
+ *
+ *     metadata growth and payload growth can collide.
+ *
+ * Leave this until later.
+ * ============================================================
+ */
 
 struct array_item_header
 {
 	size_t offset;
 	size_t size;
+
+	/*
+	 * TODO:
+	 * Consider storing alignment here if data growth/removal
+	 * rebuilds objects at new addresses.
+	 *
+	 * size_t alignment;
+	 */
 };
 
-#define array_append(arr, arr_entries, item, item_size, item_align)                                \
+struct array_header
+{
+	size_t length;        // Number of logical items.
+	size_t data_used;     // End of currently used payload region in bytes.
+	size_t data_capacity; // Total payload capacity in bytes.
+	size_t item_capacity; // Number of metadata entries allocated.
+
+	/*
+	 * Separate allocation containing the fixed-size lookup metadata.
+	 */
+	struct array_item_header *item_header;
+};
+
+struct array_header *array_init(void)
+{
+	/*
+	 * Main allocation:
+	 *
+	 *     [array_header][raw payload bytes...]
+	 */
+	struct array_header *arr = malloc(sizeof(*arr) + sizeof(unsigned char) * DATA_CAPACITY);
+
+	if (arr == NULL)
+	{
+		return NULL;
+	}
+
+	/*
+	 * Metadata allocation.
+	 *
+	 * TODO:
+	 * Keep this independent during the next growth implementation.
+	 */
+	struct array_item_header *arr_entries = malloc(sizeof(*arr_entries) * ITEM_CAPACITY);
+
+	if (arr_entries == NULL)
+	{
+		free(arr);
+		return NULL;
+	}
+
+	arr->length = 0;
+	arr->data_used = 0;
+	arr->data_capacity = DATA_CAPACITY;
+	arr->item_capacity = ITEM_CAPACITY;
+	arr->item_header = arr_entries;
+
+	return arr;
+}
+
+/*
+ * TODO: ARRAY_APPEND
+ *
+ * Main thing to revisit tomorrow:
+ *
+ * The current code calculates:
+ *
+ *     data
+ *     current_address
+ *     alignment_remainder
+ *     padding
+ *     destination_start
+ *
+ * BEFORE potentially reallocating the payload.
+ *
+ * If realloc moves `header`, those calculations belong to the
+ * old address.
+ *
+ * Explore replacing payload realloc with:
+ *
+ *     malloc new payload
+ *          ↓
+ *     rebuild/repack each item with alignment
+ *          ↓
+ *     update each metadata offset
+ *          ↓
+ *     free old payload only after success
+ *
+ * Keep item_header growth independent.
+ */
+#define array_append(arr, item, item_size, item_align)                                             \
 	do                                                                                             \
 	{                                                                                              \
-		if ((arr) == NULL || (arr_entries) == NULL)                                                \
+		if ((arr) == NULL)                                                                         \
 		{                                                                                          \
-			/* TODO: free arr and arr_entries */                                                   \
-			/* TODO: create arr and arr_entries */                                                 \
-			fputs("array_append: arr and arr_entries must not be NULL\n", stderr);                 \
-			break;                                                                                 \
+			/* Init Array Header*/                                                                 \
+			(arr) = array_init();                                                                  \
+			if ((arr) == NULL)                                                                     \
+			{                                                                                      \
+				fputs("Error: malloc failed to initialize memory\n", stderr);                      \
+				break;                                                                             \
+			}                                                                                      \
 		}                                                                                          \
                                                                                                    \
 		struct array_header *header = (struct array_header *)(arr);                                \
+		struct array_item_header *item_header = header->item_header;                               \
                                                                                                    \
-		struct array_item_header *item_header = (struct array_item_header *)(arr_entries);         \
+		if (item_header == NULL)                                                                   \
+		{                                                                                          \
+			fputs("Error: Invalid array_header \n", stderr);                                       \
+			break;                                                                                 \
+		}                                                                                          \
                                                                                                    \
 		unsigned char *data = (unsigned char *)(header + 1);                                       \
                                                                                                    \
@@ -64,18 +466,55 @@ struct array_item_header
                                                                                                    \
 		/* TODO: check integer overflow when calculating required size */                          \
                                                                                                    \
-		/* TODO: Implement growth for array */                                                     \
 		if (destination_start + append_item_size > header->data_capacity)                          \
 		{                                                                                          \
-			fputs("array_append: not enough data capacity\n", stderr);                             \
-			break;                                                                                 \
+			size_t new_capacity = header->data_capacity * GROWTH_FACTOR;                           \
+			size_t new_allocation_size = sizeof(*header) + new_capacity;                           \
+			/*                                                                                     \
+			 * Use a temporary pointer.                                                            \
+			 *                                                                                     \
+			 * If realloc fails, it returns NULL but the original allocation remains               \
+			 * valid. Assigning directly to header would lose the original pointer.                \
+			 */                                                                                    \
+			struct array_header *temporary_header = realloc(header, new_allocation_size);          \
+                                                                                                   \
+			if (temporary_header == NULL)                                                          \
+			{                                                                                      \
+				perror("array_append: realloc");                                                   \
+				break;                                                                             \
+			}                                                                                      \
+                                                                                                   \
+			header = temporary_header;                                                             \
+			header->data_capacity = new_capacity;                                                  \
+                                                                                                   \
+			/* realloc may move the allocation, so update the array pointer. */                    \
+			(arr) = (void *)(header);                                                              \
 		}                                                                                          \
                                                                                                    \
-		/* TODO: Implement growth for array_entries */                                             \
 		if (header->length >= header->item_capacity)                                               \
 		{                                                                                          \
-			fputs("array_append: not enough item metadata capacity\n", stderr);                    \
-			break;                                                                                 \
+			size_t new_capacity = header->item_capacity * GROWTH_FACTOR;                           \
+			size_t new_allocation_size = sizeof(*item_header) * new_capacity;                      \
+			/*                                                                                     \
+			 * Use a temporary pointer.                                                            \
+			 *                                                                                     \
+			 * If realloc fails, it returns NULL but the original allocation remains               \
+			 * valid. Assigning directly to header would lose the original pointer.                \
+			 */                                                                                    \
+			struct array_item_header *temporary_item_header =                                      \
+			    realloc(item_header, new_allocation_size);                                         \
+                                                                                                   \
+			if (temporary_item_header == NULL)                                                     \
+			{                                                                                      \
+				perror("array_append: realloc");                                                   \
+				break;                                                                             \
+			}                                                                                      \
+                                                                                                   \
+			item_header = temporary_item_header;                                                   \
+			header->item_capacity = new_capacity;                                                  \
+                                                                                                   \
+			/* realloc may move the allocation, so update the array pointer. */                    \
+			header->item_header = (void *)(item_header);                                           \
 		}                                                                                          \
                                                                                                    \
 		/*                                                                                         \
@@ -96,59 +535,95 @@ struct array_item_header
                                                                                                    \
 	} while (0)
 
-void *array_get(struct array_header *header, struct array_item_header *item_header, size_t index)
+/*
+ * array_get() returns a raw pointer into the array's INTERNAL
+ * payload allocation.
+ *
+ * IMPORTANT:
+ *
+ * The returned pointer is a physical address, not a permanent
+ * logical reference to an array index.
+ *
+ * If the array allocation later moves/rebuilds, previously
+ * returned pointers can become invalid.
+ *
+ * TODO:
+ *     - bounds checking
+ *     - NULL checking
+ *     - document exact invalidation policy
+ */
+void *array_get(struct array_header *arr, size_t index)
 {
+	struct array_item_header *item_header = arr->item_header;
 	struct array_item_header *item = item_header + index;
-	// Array Data
-	unsigned char *data = (unsigned char *)(header + 1);
+
+	unsigned char *data = (unsigned char *)(arr + 1);
 
 	return data + item->offset;
 }
 
-// void array_remove(struct array_header_t *array_header,
-//                   struct array_item_header_t *array_item_header, size_t index)
-// {
-// 	assert(index < array_header->length && "index out of bound");
-//
-// 	struct array_item_header_t *item_meta_data = array_item_header + index;
-//
-// 	unsigned char *array_data = (unsigned char *)(array_header + 1);
-//
-// 	size_t removed_offset = item_meta_data->offset;
-//
-// 	size_t removed_size = item_meta_data->size;
-//
-// 	size_t item_end = removed_offset + removed_size;
-//
-// 	size_t bytes_to_move = array_header->current_offset - item_end;
-//
-// 	memmove(array_data + removed_offset, array_data + item_end, bytes_to_move);
-//
-// 	for (size_t i = index; i + 1 < array_header->length; ++i)
-// 	{
-// 		array_item_header[i] = array_item_header[i + 1];
-//
-// 		array_item_header[i].offset -= removed_size;
-// 	}
-//
-// 	array_header->current_offset -= removed_size;
-//
-// 	array_header->length -= 1;
-// }
+/*
+ * CURRENT REMOVE SEMANTICS:
+ *
+ * Logical removal only.
+ *
+ * Metadata entry disappears from the logical array, but payload
+ * bytes remain physically present.
+ *
+ * Therefore a pointer obtained BEFORE remove may continue pointing
+ * at the old bytes even though array_get(index) now resolves through
+ * different metadata.
+ *
+ * TODO tomorrow:
+ *
+ *     1. Fix/review bounds checking.
+ *     2. Decide whether removed payload bytes should temporarily
+ *        be overwritten for debugging.
+ *     3. Do NOT treat memset(..., 0, size) as a generic destructor
+ *        or universal representation of a zero-valued object.
+ *     4. Leave physical compaction until alignment-aware repacking
+ *        has been designed.
+ *     5. Decide long-term fragmentation/removal policy.
+ */
+#define array_remove(arr, index)                                                                   \
+	do                                                                                             \
+	{                                                                                              \
+		if ((arr) == NULL)                                                                         \
+		{                                                                                          \
+			fputs("Error: malloc failed to initialize memory\n", stderr);                          \
+			break;                                                                                 \
+		}                                                                                          \
+                                                                                                   \
+		struct array_header *header = (struct array_header *)(arr);                                \
+		if (index > header->length || index < 0)                                                   \
+		{                                                                                          \
+			perror("out of bound");                                                                \
+			break;                                                                                 \
+		}                                                                                          \
+                                                                                                   \
+		struct array_item_header *item_header = header->item_header;                               \
+		if (item_header == NULL)                                                                   \
+		{                                                                                          \
+			fputs("Error: Invalid array_header \n", stderr);                                       \
+			break;                                                                                 \
+		}                                                                                          \
+                                                                                                   \
+		for (size_t i = index; i < header->length - 1; ++i)                                        \
+		{                                                                                          \
+			item_header[i] = item_header[i + 1];                                                   \
+		}                                                                                          \
+		header->length -= 1;                                                                       \
+	} while (0)
+
+/*
+ * TODO:
+ * Replace the final free(arr) usage with an array destruction
+ * function because arr->item_header is separately allocated.
+ */
 
 int main()
 {
-	// Init Array Header
-	struct array_header *arr = malloc(sizeof(*arr) + sizeof(unsigned char) * DATA_CAPACITY);
-
-	arr->length = 0;
-	arr->data_used = 0;
-	arr->data_capacity = DATA_CAPACITY;
-	arr->item_capacity = ITEM_CAPACITY;
-
-	// Init Array Items header
-	struct array_item_header *arr_entries = malloc(sizeof(*arr_entries) * ITEM_CAPACITY);
-
+	void *arr = NULL;
 	char item[] = "skills";
 	// char *item2= "newfoundland";
 
@@ -157,18 +632,24 @@ int main()
 	int item1 = 676;
 	float item2 = 212.0;
 
-	array_append(arr, arr_entries, item, item_size, alignof(char));
+	array_append(arr, item, item_size, alignof(char));
 
-	array_append(arr, arr_entries, &item1, sizeof(item1), alignof(int));
+	array_append(arr, &item1, sizeof(item1), alignof(int));
 
-	array_append(arr, arr_entries, &item2, sizeof(item2), alignof(float));
+	array_append(arr, &item2, sizeof(item2), alignof(float));
 
-	char *arr_item = (char *)array_get(arr, arr_entries, 0);
-	int *arr_item1 = (int *)array_get(arr, arr_entries, 1);
-	float *arr_item2 = (float *)array_get(arr, arr_entries, 2);
+	char *arr_item = (char *)array_get(arr, 0);
+	int *arr_item1 = (int *)array_get(arr, 1);
+	float *arr_item2 = (float *)array_get(arr, 2);
 	printf("%s\n", arr_item);
 	printf("%d\n", *arr_item1);
 	printf("%f\n", *arr_item2);
+
+	array_remove(arr, 1);
+
+	printf("\n");
+	int *arr_item_test = (int *)array_get(arr, 1);
+	printf("%d\n", *arr_item_test);
 
 	// char *item2= "newfoundland";
 	// char *item3 = "praise";
@@ -203,13 +684,13 @@ int main()
 	//         array_item_header,
 	//         0
 	//     );
-	//
-	// // array_remove(
-	// //         array_header,
-	// //         array_item_header,
-	// //         array_header->length - 1
-	// //     );
-	//
+
+	// array_remove(
+	//         array_header,
+	//         array_item_header,
+	//         array_header->length - 1
+	//     );
+
 	// for (size_t i = 0; i < array_header->length; ++i){
 	//     char *arr_item = (char *)array_get(
 	//         array_header,
@@ -220,6 +701,5 @@ int main()
 	// }
 
 	free(arr);
-	free(arr_entries);
 	return 0;
 }
